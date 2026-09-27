@@ -1,3 +1,85 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>器官分配协调台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}</style>
-<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p><section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;background:#f5f7fb;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:18px}
+h2{margin:0 0 12px;font-size:17px}
+pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px;max-height:320px}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#be123c;color:white;border:0;border-radius:6px;cursor:pointer}
+table{border-collapse:collapse;width:100%}th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;font-size:14px}
+th{background:#f1f5f9;white-space:nowrap}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;color:#fff;font-size:13px}
+.normal{background:#15803d}.warning{background:#d97706}.exceeded{background:#b91c1c}
+.muted{color:#64748b}.failed{color:#b91c1c;font-weight:600}
+</style>
+<h1>器官分配协调台</h1>
+<section>
+  <b>身份</b>
+  <input id="u" value="allocator">
+  <select id="r"><option>allocation_officer</option><option>coordinator</option><option>auditor</option><option>hospital</option><option>viewer</option></select>
+  <input id="h" placeholder="X-Hospital（医院角色）">
+  <button onclick="load()">刷新</button>
+  <span class="muted" id="clock"></span>
+</section>
+<section>
+  <h2>冷缺血窗口看板</h2>
+  <p class="muted">按当前时间计算离体后剩余分钟：正常 / 预警（剩余不足一成，接受与交接需调度员确认）/ 超限（器官失效，禁止接受、交接、植入）。未登记离体数据的旧记录继续按原有效期办理。</p>
+  <table id="donors"></table>
+</section>
+<section>
+  <h2>处置痕迹</h2>
+  <select id="ak"><option value="donors">器官</option><option value="allocations">分配</option></select>
+  <input id="aid" type="number" min="1" placeholder="ID" style="width:90px">
+  <button onclick="showAudit()">查询</button>
+  <span class="muted">需 auditor / allocation_officer / coordinator 身份</span>
+  <table id="audit"></table>
+</section>
+<section>
+  <h2>分配列表</h2>
+  <table id="allocs"></table>
+</section>
+<section>
+  <h2>原始状态</h2>
+  <pre id="o"></pre>
+</section>
+<script>
+let state=null,fetchedAt=0;
+const STAGE_LABELS={propose:"提出分配",accept:"接受",transit:"转运",delay:"延误上报",handoff:"发起交接",handoff_accept:"确认交接",implant:"植入",withdraw:"撤回"};
+const ACTION_LABELS={donor_registered:"登记器官",allocation_proposed:"提出分配",allocation_accepted:"接受分配",transfer_started:"开始转运",logistics_delay:"延误上报",handoff_initiated:"发起交接",handoff_accepted:"确认交接",organ_implanted:"确认植入",allocation_withdrawn:"撤回分配",allocation_expired:"分配过期",organ_expired:"器官过期",cold_ischemia_failed:"冷缺血超限·器官失效"};
+const DONOR_STATUS={available:"可分配",allocated:"已分配",expired:"已过期",used:"已植入",failed:"已失效"};
+const ALLOC_STATUS={proposed:"已提出",accepted:"已接受",in_transit:"转运中",handed_off:"已交接",implanted:"已植入",withdrawn:"已撤回",expired:"已过期"};
+const TIER_LABELS={normal:"正常",warning:"预警",exceeded:"超限"};
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function headers(){const x={"X-User-Id":u.value,"X-Role":r.value};if(h.value)x["X-Hospital"]=h.value;return x}
+async function load(){
+  const res=await fetch("/api/state",{headers:headers()});state=await res.json();fetchedAt=Date.now();render();
+}
+function coldCell(d){
+  if(d.status==="failed")
+    return `<span class=failed>已失效</span> ${esc(STAGE_LABELS[d.cold_failed_stage]||d.cold_failed_stage||"")}环节 · 实际超时 ${d.cold_overtime_minutes} 分钟`;
+  const c=d.cold_ischemia;
+  if(!c)return `<span class=muted>旧记录 · 按有效期办理</span>`;
+  const remain=c.remaining_minutes-(Date.now()-fetchedAt)/60000;
+  const tier=remain<=0?"exceeded":remain*10<c.max_cold_minutes?"warning":"normal";
+  const txt=remain<=0?`超时 ${Math.round(-remain)} 分钟`:`剩余 ${Math.floor(remain)} 分钟`;
+  return `${txt} <span class="badge ${tier}">${TIER_LABELS[tier]}</span> <span class=muted>离体 ${esc(c.explant_at)} · 耐受 ${c.max_cold_minutes} 分钟</span>`;
+}
+function render(){
+  if(!state)return;
+  clock.textContent=state.server_time?`服务器时间 ${state.server_time}`:"";
+  donors.innerHTML="<tr><th>ID</th><th>器官</th><th>血型</th><th>医院</th><th>状态</th><th>有效期至</th><th>冷缺血窗口</th></tr>"+
+    ((state.donors||[]).map(d=>`<tr><td>${d.id}</td><td>${esc(d.organ)}</td><td>${esc(d.blood_type)}</td><td>${esc(d.hospital)}</td><td>${DONOR_STATUS[d.status]||esc(d.status)}</td><td>${esc(d.expires_at)}</td><td>${coldCell(d)}</td></tr>`).join("")||'<tr><td colspan="7" class=muted>无数据</td></tr>');
+  allocs.innerHTML="<tr><th>ID</th><th>器官</th><th>候选</th><th>状态</th><th>延误(分)</th><th>更新时间</th></tr>"+
+    ((state.allocations||[]).map(a=>`<tr><td>${a.id}</td><td>${a.donor_id??""}</td><td>${a.candidate_id??""}</td><td>${ALLOC_STATUS[a.status]||esc(a.status)}</td><td>${a.delayed_minutes??""}</td><td>${esc(a.updated_at)}</td></tr>`).join("")||'<tr><td colspan="6" class=muted>无数据</td></tr>');
+  o.textContent=JSON.stringify(state,null,2);
+}
+async function showAudit(){
+  if(!aid.value)return;
+  const res=await fetch(`/api/${ak.value}/${aid.value}/audit`,{headers:headers()});
+  const data=await res.json();
+  if(!res.ok){audit.innerHTML=`<tr><td class=failed>${esc(data.message||data.error)}</td></tr>`;return}
+  audit.innerHTML="<tr><th>时间</th><th>操作人</th><th>角色</th><th>动作</th><th>详情</th></tr>"+
+    (data.audit.map(a=>`<tr><td>${esc(a.created_at)}</td><td>${esc(a.actor)}</td><td>${esc(a.role)}</td><td>${ACTION_LABELS[a.action]||esc(a.action)}</td><td>${esc(a.detail_json)}</td></tr>`).join("")||'<tr><td class=muted>暂无记录</td></tr>');
+}
+setInterval(render,1000);setInterval(load,15000);load();
+</script>

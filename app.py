@@ -16,11 +16,14 @@ from urllib.parse import urlparse
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
+COLD_WARNING_RATIO = 0.1  # 剩余不足一成进入预警
+STAGE_LABELS = {"propose": "提出分配", "accept": "接受", "transit": "转运", "delay": "延误上报",
+                "handoff": "发起交接", "handoff_accept": "确认交接", "implant": "植入", "withdraw": "撤回"}
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message); self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, commit: bool = False):
+        super().__init__(message); self.status, self.code, self.message, self.commit = status, code, message, commit
 
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -38,6 +41,19 @@ def blood_compatible(donor: str, recipient: str) -> bool:
     }.get(donor.upper(), set()) and recipient.upper() in {"O", "A", "B", "AB"} and recipient.upper() in {
         "O": {"O", "A", "B", "AB"}, "A": {"A", "AB"}, "B": {"B", "AB"}, "AB": {"AB"},
     }.get(donor.upper(), set())
+
+
+def cold_window(donor: Any, now: datetime | None = None) -> dict[str, Any] | None:
+    """冷缺血剩余窗口。旧记录（未登记离体数据）返回 None，继续按原有效期办理。"""
+    explant, limit = donor["explant_at"], donor["max_cold_minutes"]
+    if not explant or not limit:
+        return None
+    elapsed = ((now or utcnow()) - parse_time(explant)).total_seconds() / 60
+    remaining = limit - elapsed
+    # 用 remaining*10 < limit 代替 remaining < limit*0.1，避免浮点误差让"正好一成"落入预警
+    tier = "exceeded" if remaining <= 0 else "warning" if remaining * 10 < limit else "normal"
+    return {"explant_at": explant, "max_cold_minutes": limit, "elapsed_minutes": round(elapsed, 1),
+            "remaining_minutes": round(remaining, 1), "tier": tier, "overtime_minutes": round(max(0.0, -remaining), 1)}
 
 
 class Repository:
@@ -74,14 +90,27 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(donors)")}
+        for column, ddl in {
+            "explant_at": "ALTER TABLE donors ADD COLUMN explant_at TEXT",
+            "max_cold_minutes": "ALTER TABLE donors ADD COLUMN max_cold_minutes INTEGER",
+            "cold_failed_stage": "ALTER TABLE donors ADD COLUMN cold_failed_stage TEXT",
+            "cold_overtime_minutes": "ALTER TABLE donors ADD COLUMN cold_overtime_minutes REAL",
+        }.items():
+            if column not in existing: self.conn.execute(ddl)
 
     @contextmanager
     def tx(self):
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            yield self.conn; self.conn.execute("COMMIT")
+            yield self.conn
+        except ApiError as exc:
+            # commit=True 的业务拒绝携带必须落地的状态变更（如冷缺血超限标记失效）
+            self.conn.execute("COMMIT" if exc.commit else "ROLLBACK"); raise
         except Exception:
             self.conn.execute("ROLLBACK"); raise
+        else:
+            self.conn.execute("COMMIT")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, allocation_id: int | None, donor_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -102,6 +131,10 @@ class OrganAllocationService:
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None: return dict(row) if row else None
 
+    @staticmethod
+    def _donor_view(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row); item["cold_ischemia"] = cold_window(row); return item
+
     def register_donor(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"coordinator", "allocation_officer"}: raise ApiError(403, "donor_forbidden", "当前角色不能登记器官")
         required = ("blood_type", "organ", "hospital", "region", "available_at", "expires_at")
@@ -110,12 +143,20 @@ class OrganAllocationService:
         if blood not in {"O", "A", "B", "AB"}: raise ApiError(400, "invalid_blood_type", "血型必须为 O/A/B/AB")
         available, expires = parse_time(body["available_at"]), parse_time(body["expires_at"])
         if expires <= available: raise ApiError(400, "invalid_window", "可用窗口结束时间必须晚于开始时间")
+        explant_raw, max_cold = body.get("explant_at"), body.get("max_cold_minutes")
+        if bool(explant_raw) != bool(max_cold is not None): raise ApiError(400, "cold_fields_pair", "离体时刻 explant_at 和最长耐受 max_cold_minutes 需同时填写")
+        explant = parse_time(explant_raw) if explant_raw else None
+        if max_cold is not None and (not isinstance(max_cold, int) or isinstance(max_cold, bool) or max_cold <= 0):
+            raise ApiError(400, "invalid_cold_minutes", "最长耐受时间必须为正整数分钟")
         with self.repo.tx() as conn:
-            cur = conn.execute("""INSERT INTO donors(blood_type,organ,hospital,region,available_at,expires_at,clinical_match,created_by,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?)""",
-                               (blood, organ, body["hospital"], body["region"], iso(available), iso(expires), int(body.get("clinical_match", 0)), actor, iso()))
-            donor_id = cur.lastrowid; Repository.audit(conn, None, donor_id, actor, role, "donor_registered", {"organ": organ, "expires_at": iso(expires)})
-            return dict(conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone())
+            cur = conn.execute("""INSERT INTO donors(blood_type,organ,hospital,region,available_at,expires_at,clinical_match,explant_at,max_cold_minutes,created_by,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                               (blood, organ, body["hospital"], body["region"], iso(available), iso(expires), int(body.get("clinical_match", 0)),
+                                iso(explant) if explant else None, max_cold, actor, iso()))
+            donor_id = cur.lastrowid
+            Repository.audit(conn, None, donor_id, actor, role, "donor_registered",
+                             {"organ": organ, "expires_at": iso(expires), "explant_at": iso(explant) if explant else None, "max_cold_minutes": max_cold})
+            return self._donor_view(conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone())
 
     def register_candidate(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"coordinator", "allocation_officer"}: raise ApiError(403, "candidate_forbidden", "当前角色不能登记候选患者")
@@ -149,7 +190,7 @@ class OrganAllocationService:
                     item = dict(candidate); item["match"] = self._score(donor, candidate); rows.append(item)
             rows.sort(key=lambda item: (-item["match"]["total"], item["id"]))
             for index, item in enumerate(rows, 1): item["rank"] = index
-            return {"donor": dict(donor), "candidates": rows}
+            return {"donor": self._donor_view(donor), "candidates": rows}
 
     def propose(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "allocation_officer": raise ApiError(403, "allocate_forbidden", "只有分配员可以提出分配")
@@ -159,6 +200,10 @@ class OrganAllocationService:
             donor = conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone(); candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
             if not donor or not candidate: raise ApiError(404, "not_found", "器官或候选患者不存在")
             if donor["status"] != "available": raise ApiError(409, "donor_unavailable", "器官当前不可分配")
+            cold = cold_window(donor)
+            if cold and cold["tier"] == "exceeded":
+                self._fail_cold(conn, None, donor, actor, role, "propose", cold)
+                raise ApiError(409, "cold_ischemia_exceeded", f"冷缺血已超最长耐受 {cold['overtime_minutes']} 分钟，器官失效，禁止提出分配", commit=True)
             if parse_time(donor["expires_at"]) <= utcnow():
                 conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?", (donor_id,))
                 Repository.audit(conn, None, donor_id, actor, role, "organ_expired", {"candidate_id": candidate_id})
@@ -178,6 +223,7 @@ class OrganAllocationService:
 
     def _allocation(self, conn: sqlite3.Connection, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
         row = conn.execute("""SELECT a.*,d.blood_type donor_blood,d.organ,d.hospital donor_hospital,d.region donor_region,d.available_at,d.expires_at,d.status donor_status,
+                                     d.explant_at,d.max_cold_minutes,d.cold_failed_stage,d.cold_overtime_minutes,
                                      c.patient_name,c.blood_type candidate_blood,c.hospital candidate_hospital,c.region candidate_region,c.urgency,c.wait_days
                               FROM allocations a JOIN donors d ON d.id=a.donor_id JOIN candidates c ON c.id=a.candidate_id WHERE a.id=?""", (allocation_id,)).fetchone()
         if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
@@ -186,34 +232,63 @@ class OrganAllocationService:
             raise ApiError(403, "allocation_forbidden", "医院不能查看与本机构无关的分配")
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
+        result["cold_ischemia"] = cold_window(row)
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
         return result
 
-    def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
+    @staticmethod
+    def _fail_cold(conn: sqlite3.Connection, allocation_id: int | None, donor: sqlite3.Row, actor: str, role: str, stage: str, cold: dict[str, Any]) -> None:
+        """冷缺血超限：器官标为失效，记录触发环节和实际超时分钟，终止进行中的分配。"""
+        conn.execute("UPDATE donors SET status='failed',cold_failed_stage=?,cold_overtime_minutes=?,revision=revision+1 WHERE id=?",
+                     (stage, cold["overtime_minutes"], donor["id"]))
+        if allocation_id is not None:
+            conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
+        Repository.audit(conn, allocation_id, donor["id"], actor, role, "cold_ischemia_failed",
+                         {"stage": stage, "overtime_minutes": cold["overtime_minutes"], "elapsed_minutes": cold["elapsed_minutes"], "max_cold_minutes": cold["max_cold_minutes"]})
+
+    @staticmethod
+    def _warning_gate(donor: sqlite3.Row, body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+        """剩余不足一成时要求调度员确认，返回 (确认人, 冷缺血窗口)。"""
+        cold = cold_window(donor)
+        if not cold or cold["tier"] != "warning": return None, cold
+        dispatcher = str(body.get("dispatcher_confirm", "")).strip()
+        if not dispatcher:
+            raise ApiError(409, "cold_confirm_required", f"冷缺血剩余不足一成（约 {cold['remaining_minutes']} 分钟），需调度员确认：请携带 dispatcher_confirm")
+        return dispatcher, cold
+
+    def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str, stage: str) -> tuple[sqlite3.Row, sqlite3.Row]:
         row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
         if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
         if row["status"] in {"withdrawn", "expired", "implanted"}: raise ApiError(409, "allocation_closed", "分配已结束")
         donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+        cold = cold_window(donor)
+        if cold and cold["tier"] == "exceeded":
+            self._fail_cold(conn, allocation_id, donor, actor, role, stage, cold)
+            raise ApiError(409, "cold_ischemia_exceeded",
+                           f"冷缺血已超最长耐受 {cold['overtime_minutes']} 分钟，器官失效，{STAGE_LABELS.get(stage, stage)}环节禁止继续", commit=True)
         if parse_time(donor["expires_at"]) <= utcnow():
             conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
             conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?", (donor["id"],))
             Repository.audit(conn, allocation_id, donor["id"], actor, role, "allocation_expired", {"reason": "organ_window_elapsed"})
             raise ApiError(409, "organ_expired", "器官已经超过可用时间，禁止继续流转")
-        return row
+        return row, donor
 
     def accept(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "hospital_required", "只有接收医院可以接受器官")
         expected = body.get("expected_revision")
         if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必填")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
+            row, donor = self._ensure_active(conn, allocation_id, actor, role, "accept")
             candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
             if candidate["hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院接受")
             if row["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
             if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "当前状态不能接受")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
+            dispatcher, cold = self._warning_gate(donor, body)
             conn.execute("UPDATE allocations SET status='accepted',accepted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
-            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", {"hospital": hospital})
+            detail: dict[str, Any] = {"hospital": hospital}
+            if dispatcher: detail.update({"dispatcher_confirm": dispatcher, "cold_remaining_minutes": cold["remaining_minutes"]})
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", detail)
             return self._allocation(conn, allocation_id, role, hospital)
 
     def mark_transit(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -222,7 +297,7 @@ class OrganAllocationService:
         if not isinstance(temp, (int, float)) or not -2 <= float(temp) <= 8:
             raise ApiError(409, "cold_chain_violation", "冷链温度必须保持在 -2°C 到 8°C")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
+            row, _ = self._ensure_active(conn, allocation_id, actor, role, "transit")
             if row["status"] != "accepted": raise ApiError(409, "invalid_transition", "只有已接受分配可以进入转运")
             conn.execute("UPDATE allocations SET status='in_transit',cold_chain_temp=?,revision=revision+1,updated_at=? WHERE id=?", (float(temp), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "transfer_started", {"cold_chain_temp": temp})
@@ -233,7 +308,7 @@ class OrganAllocationService:
         minutes, reason = body.get("delayed_minutes"), str(body.get("reason", "")).strip()
         if not isinstance(minutes, int) or minutes <= 0 or not reason: raise ApiError(400, "invalid_delay", "delayed_minutes 必须为正整数且 reason 必填")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
+            row, _ = self._ensure_active(conn, allocation_id, actor, role, "delay")
             conn.execute("UPDATE allocations SET delayed_minutes=delayed_minutes+?,revision=revision+1,updated_at=? WHERE id=?", (minutes, iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "logistics_delay", {"minutes": minutes, "reason": reason, "at_risk": minutes >= 120})
             return self._allocation(conn, allocation_id, role, "")
@@ -244,38 +319,43 @@ class OrganAllocationService:
         if not isinstance(expected, int) or not target or not isinstance(temp, (int, float)) or not -2 <= float(temp) <= 8:
             raise ApiError(400, "invalid_handoff", "expected_revision、to_hospital 和合规冷链温度必填")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
-            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+            row, donor = self._ensure_active(conn, allocation_id, actor, role, "handoff")
             candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
             if hospital != donor["hospital"]: raise ApiError(403, "wrong_hospital", "只能由器官来源医院发起交接")
             if target != candidate["hospital"]: raise ApiError(409, "wrong_destination", "交接目标必须与候选患者医院一致")
             if row["status"] != "in_transit": raise ApiError(409, "invalid_transition", "只有转运中分配可以交接")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配版本已变化")
+            dispatcher, cold = self._warning_gate(donor, body)
             try:
                 cur = conn.execute("""INSERT INTO handoffs(allocation_id,from_hospital,to_hospital,cold_chain_temp,initiated_by,initiated_at)
                                       VALUES(?,?,?,?,?,?)""", (allocation_id, hospital, target, float(temp), actor, iso()))
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "handoff_exists", "交接已经登记") from exc
-            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_initiated", {"target": target, "cold_chain_temp": temp})
+            detail: dict[str, Any] = {"target": target, "cold_chain_temp": temp}
+            if dispatcher: detail.update({"dispatcher_confirm": dispatcher, "cold_remaining_minutes": cold["remaining_minutes"]})
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_initiated", detail)
             return {"handoff": dict(conn.execute("SELECT * FROM handoffs WHERE id=?", (cur.lastrowid,)).fetchone()), "allocation": self._allocation(conn, allocation_id, role, hospital)}
 
     def accept_handoff(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "handoff_forbidden", "只有医院可以确认交接")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
+            row, donor = self._ensure_active(conn, allocation_id, actor, role, "handoff_accept")
             handoff = conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone()
             if not handoff: raise ApiError(409, "handoff_missing", "尚未发起交接")
             if handoff["to_hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由接收医院确认交接")
             if handoff["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
+            dispatcher, cold = self._warning_gate(donor, body)
             conn.execute("UPDATE handoffs SET status='accepted',accepted_by=?,accepted_at=? WHERE id=?", (actor, iso(), handoff["id"]))
             conn.execute("UPDATE allocations SET status='handed_off',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
-            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_accepted", {"handoff_id": handoff["id"]})
+            detail: dict[str, Any] = {"handoff_id": handoff["id"]}
+            if dispatcher: detail.update({"dispatcher_confirm": dispatcher, "cold_remaining_minutes": cold["remaining_minutes"]})
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_accepted", detail)
             return self._allocation(conn, allocation_id, role, hospital)
 
     def implant(self, allocation_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "allocation_officer": raise ApiError(403, "implant_forbidden", "只有分配员可以确认植入")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
+            row, _ = self._ensure_active(conn, allocation_id, actor, role, "implant")
             if row["status"] != "handed_off": raise ApiError(409, "invalid_transition", "交接完成后才能确认植入")
             conn.execute("UPDATE allocations SET status='implanted',implanted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             conn.execute("UPDATE donors SET status='used',revision=revision+1 WHERE id=?", (row["donor_id"],))
@@ -287,7 +367,7 @@ class OrganAllocationService:
         reason = str(body.get("reason", "")).strip()
         if not reason: raise ApiError(400, "reason_required", "撤回原因必填")
         with self.repo.tx() as conn:
-            row = self._ensure_active(conn, allocation_id, actor, role)
+            row, _ = self._ensure_active(conn, allocation_id, actor, role, "withdraw")
             candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
             if hospital != candidate["hospital"]: raise ApiError(403, "wrong_hospital", "只能由候选患者医院撤回")
             if row["status"] not in {"proposed", "accepted"}: raise ApiError(409, "invalid_transition", "转运开始后不能直接撤回")
@@ -305,10 +385,15 @@ class OrganAllocationService:
         if role not in {"auditor", "allocation_officer"}: raise ApiError(403, "audit_forbidden", "当前角色不能查看审计记录")
         return [dict(r) for r in self.repo.conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE allocation_id=? ORDER BY id", (allocation_id,))]
 
+    def donor_audit(self, donor_id: int, role: str) -> list[dict[str, Any]]:
+        if role not in {"auditor", "allocation_officer", "coordinator"}: raise ApiError(403, "audit_forbidden", "当前角色不能查看审计记录")
+        if not self.repo.conn.execute("SELECT 1 FROM donors WHERE id=?", (donor_id,)).fetchone(): raise ApiError(404, "donor_not_found", "器官不存在")
+        return [dict(r) for r in self.repo.conn.execute("SELECT allocation_id,actor,role,action,detail_json,created_at FROM audit_log WHERE donor_id=? ORDER BY id", (donor_id,))]
+
     def state(self, role: str, hospital: str) -> dict[str, Any]:
         conn = self.repo.conn
         if role == "hospital":
-            donors = [dict(r) for r in conn.execute("SELECT * FROM donors WHERE hospital=?", (hospital,))]
+            donors = [self._donor_view(r) for r in conn.execute("SELECT * FROM donors WHERE hospital=?", (hospital,))]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates WHERE hospital=?", (hospital,))]
             allocated = [dict(r) for r in conn.execute("SELECT a.* FROM allocations a JOIN candidates c ON c.id=a.candidate_id WHERE c.hospital=?", (hospital,))]
         elif role == "viewer":
@@ -316,7 +401,7 @@ class OrganAllocationService:
             candidates = []
             allocated = [dict(r) for r in conn.execute("SELECT id,status,updated_at FROM allocations WHERE status='implanted' ORDER BY id DESC")]
         else:
-            donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
+            donors = [self._donor_view(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
         return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
@@ -342,6 +427,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, hospital)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
+        if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.donor_audit(int(parts[2]), role)}
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
         raise ApiError(404, "not_found", "接口不存在")
