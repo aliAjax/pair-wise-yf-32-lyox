@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -16,11 +16,14 @@ from urllib.parse import urlparse
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
+# 冷缺血预警状态下需要调度员确认的环节
+COLD_CONFIRM_STAGES = {"accept", "handoff_initiate", "handoff_accept"}
+STAGE_LABELS = {"accept": "接受", "handoff_initiate": "交接发起", "handoff_accept": "交接确认", "implant": "植入"}
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message); self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, commit: bool = False):
+        super().__init__(message); self.status, self.code, self.message, self.commit = status, code, message, commit
 
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -30,6 +33,21 @@ def parse_time(value: str | None) -> datetime:
     try: parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc: raise ApiError(400, "invalid_time", f"时间格式错误: {value}") from exc
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def cold_ischemia_info(donor: Any, now: datetime | None = None) -> dict[str, Any] | None:
+    """按当前时间计算冷缺血剩余窗口；未登记离体信息的旧记录返回 None，继续按原有效期办理。"""
+    explant, tolerance = donor["explant_at"], donor["max_tolerance_minutes"]
+    if not explant or tolerance is None: return None
+    now = now or utcnow()
+    deadline = parse_time(explant) + timedelta(minutes=tolerance)
+    remaining_seconds = (deadline - now).total_seconds()
+    if remaining_seconds < 0: level = "exceeded"
+    elif remaining_seconds < tolerance * 6: level = "warning"  # 剩余不足一成（耐受的 10%）
+    else: level = "normal"
+    return {"explant_at": explant, "max_tolerance_minutes": tolerance, "deadline": iso(deadline),
+            "remaining_minutes": int(remaining_seconds // 60), "overtime_minutes": round(max(0.0, -remaining_seconds / 60), 1),
+            "level": level}
 
 
 def blood_compatible(donor: str, recipient: str) -> bool:
@@ -49,6 +67,7 @@ class Repository:
         CREATE TABLE IF NOT EXISTS donors(
             id INTEGER PRIMARY KEY AUTOINCREMENT, blood_type TEXT NOT NULL, organ TEXT NOT NULL, hospital TEXT NOT NULL,
             region TEXT NOT NULL, available_at TEXT NOT NULL, expires_at TEXT NOT NULL, clinical_match INTEGER NOT NULL DEFAULT 0,
+            explant_at TEXT, max_tolerance_minutes INTEGER,
             status TEXT NOT NULL DEFAULT 'available', revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS candidates(
@@ -74,14 +93,25 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        donor_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(donors)")}
+        if "explant_at" not in donor_cols: self.conn.execute("ALTER TABLE donors ADD COLUMN explant_at TEXT")
+        if "max_tolerance_minutes" not in donor_cols: self.conn.execute("ALTER TABLE donors ADD COLUMN max_tolerance_minutes INTEGER")
 
     @contextmanager
     def tx(self):
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            yield self.conn; self.conn.execute("COMMIT")
+            yield self.conn
+        except ApiError as exc:
+            # commit=True 的错误（如冷缺血超限）需要先落库失效标记和审计再抛出
+            self.conn.execute("COMMIT" if exc.commit else "ROLLBACK"); raise
         except Exception:
             self.conn.execute("ROLLBACK"); raise
+        else:
+            self.conn.execute("COMMIT")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, allocation_id: int | None, donor_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -110,12 +140,24 @@ class OrganAllocationService:
         if blood not in {"O", "A", "B", "AB"}: raise ApiError(400, "invalid_blood_type", "血型必须为 O/A/B/AB")
         available, expires = parse_time(body["available_at"]), parse_time(body["expires_at"])
         if expires <= available: raise ApiError(400, "invalid_window", "可用窗口结束时间必须晚于开始时间")
+        explant_raw, tolerance = body.get("explant_at") or None, body.get("max_tolerance_minutes")
+        if (explant_raw is None) != (tolerance is None):
+            raise ApiError(400, "cold_ischemia_incomplete", "离体时刻 explant_at 与最长耐受 max_tolerance_minutes 需同时填写")
+        explant_at = None
+        if tolerance is not None:
+            if not isinstance(tolerance, int) or isinstance(tolerance, bool) or tolerance <= 0:
+                raise ApiError(400, "invalid_tolerance", "最长耐受时间必须为正整数分钟")
+            explant_at = iso(parse_time(explant_raw))
         with self.repo.tx() as conn:
-            cur = conn.execute("""INSERT INTO donors(blood_type,organ,hospital,region,available_at,expires_at,clinical_match,created_by,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?)""",
-                               (blood, organ, body["hospital"], body["region"], iso(available), iso(expires), int(body.get("clinical_match", 0)), actor, iso()))
-            donor_id = cur.lastrowid; Repository.audit(conn, None, donor_id, actor, role, "donor_registered", {"organ": organ, "expires_at": iso(expires)})
-            return dict(conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone())
+            cur = conn.execute("""INSERT INTO donors(blood_type,organ,hospital,region,available_at,expires_at,clinical_match,explant_at,max_tolerance_minutes,created_by,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                               (blood, organ, body["hospital"], body["region"], iso(available), iso(expires), int(body.get("clinical_match", 0)), explant_at, tolerance, actor, iso()))
+            donor_id = cur.lastrowid
+            Repository.audit(conn, None, donor_id, actor, role, "donor_registered",
+                             {"organ": organ, "expires_at": iso(expires), "explant_at": explant_at, "max_tolerance_minutes": tolerance})
+            donor = dict(conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone())
+            donor["cold_ischemia"] = cold_ischemia_info(donor)
+            return donor
 
     def register_candidate(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"coordinator", "allocation_officer"}: raise ApiError(403, "candidate_forbidden", "当前角色不能登记候选患者")
@@ -149,7 +191,8 @@ class OrganAllocationService:
                     item = dict(candidate); item["match"] = self._score(donor, candidate); rows.append(item)
             rows.sort(key=lambda item: (-item["match"]["total"], item["id"]))
             for index, item in enumerate(rows, 1): item["rank"] = index
-            return {"donor": dict(donor), "candidates": rows}
+            donor_info = dict(donor); donor_info["cold_ischemia"] = cold_ischemia_info(donor)
+            return {"donor": donor_info, "candidates": rows}
 
     def propose(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "allocation_officer": raise ApiError(403, "allocate_forbidden", "只有分配员可以提出分配")
@@ -177,11 +220,13 @@ class OrganAllocationService:
             return self._allocation(conn, allocation_id, role, "")
 
     def _allocation(self, conn: sqlite3.Connection, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
-        row = conn.execute("""SELECT a.*,d.blood_type donor_blood,d.organ,d.hospital donor_hospital,d.region donor_region,d.available_at,d.expires_at,d.status donor_status,
+        row = conn.execute("""SELECT a.*,d.blood_type donor_blood,d.organ,d.hospital donor_hospital,d.region donor_region,d.available_at,d.expires_at,
+                                     d.explant_at,d.max_tolerance_minutes,d.status donor_status,
                                      c.patient_name,c.blood_type candidate_blood,c.hospital candidate_hospital,c.region candidate_region,c.urgency,c.wait_days
                               FROM allocations a JOIN donors d ON d.id=a.donor_id JOIN candidates c ON c.id=a.candidate_id WHERE a.id=?""", (allocation_id,)).fetchone()
         if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
         result = dict(row)
+        result["cold_ischemia"] = cold_ischemia_info(row)
         if role == "hospital" and hospital not in {row["donor_hospital"], row["candidate_hospital"]}:
             raise ApiError(403, "allocation_forbidden", "医院不能查看与本机构无关的分配")
         if role == "hospital" and hospital != row["candidate_hospital"]:
@@ -201,6 +246,27 @@ class OrganAllocationService:
             raise ApiError(409, "organ_expired", "器官已经超过可用时间，禁止继续流转")
         return row
 
+    def _cold_guard(self, conn: sqlite3.Connection, row: sqlite3.Row, actor: str, role: str, stage: str, body: dict[str, Any]) -> None:
+        """冷缺血窗口管控：超限拒绝并标记失效；预警（剩余不足一成）要求调度员确认。旧记录跳过。"""
+        donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+        info = cold_ischemia_info(donor)
+        if info is None: return
+        if info["level"] == "exceeded":
+            conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), row["id"]))
+            conn.execute("UPDATE donors SET status='failed',revision=revision+1 WHERE id=?", (donor["id"],))
+            Repository.audit(conn, row["id"], donor["id"], actor, role, "organ_cold_ischemia_failed",
+                             {"stage": stage, "overtime_minutes": info["overtime_minutes"], "deadline": info["deadline"],
+                              "max_tolerance_minutes": info["max_tolerance_minutes"]})
+            raise ApiError(409, "cold_ischemia_exceeded",
+                           f"冷缺血已超时 {info['overtime_minutes']} 分钟，器官已标记失效，禁止继续{STAGE_LABELS[stage]}", commit=True)
+        if info["level"] == "warning" and stage in COLD_CONFIRM_STAGES:
+            confirmer = str(body.get("coordinator_confirmed_by", "")).strip()
+            if not confirmer:
+                raise ApiError(409, "coordinator_confirmation_required",
+                               f"冷缺血剩余 {info['remaining_minutes']} 分钟，不足耐受一成，需调度员确认：请在请求体携带 coordinator_confirmed_by 重试")
+            Repository.audit(conn, row["id"], donor["id"], actor, role, "coordinator_cold_ischemia_confirmed",
+                             {"stage": stage, "coordinator": confirmer, "remaining_minutes": info["remaining_minutes"]})
+
     def accept(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "hospital": raise ApiError(403, "hospital_required", "只有接收医院可以接受器官")
         expected = body.get("expected_revision")
@@ -212,6 +278,7 @@ class OrganAllocationService:
             if row["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
             if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "当前状态不能接受")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
+            self._cold_guard(conn, row, actor, role, "accept", body)
             conn.execute("UPDATE allocations SET status='accepted',accepted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", {"hospital": hospital})
             return self._allocation(conn, allocation_id, role, hospital)
@@ -251,6 +318,7 @@ class OrganAllocationService:
             if target != candidate["hospital"]: raise ApiError(409, "wrong_destination", "交接目标必须与候选患者医院一致")
             if row["status"] != "in_transit": raise ApiError(409, "invalid_transition", "只有转运中分配可以交接")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配版本已变化")
+            self._cold_guard(conn, row, actor, role, "handoff_initiate", body)
             try:
                 cur = conn.execute("""INSERT INTO handoffs(allocation_id,from_hospital,to_hospital,cold_chain_temp,initiated_by,initiated_at)
                                       VALUES(?,?,?,?,?,?)""", (allocation_id, hospital, target, float(temp), actor, iso()))
@@ -267,6 +335,7 @@ class OrganAllocationService:
             if not handoff: raise ApiError(409, "handoff_missing", "尚未发起交接")
             if handoff["to_hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由接收医院确认交接")
             if handoff["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
+            self._cold_guard(conn, row, actor, role, "handoff_accept", body)
             conn.execute("UPDATE handoffs SET status='accepted',accepted_by=?,accepted_at=? WHERE id=?", (actor, iso(), handoff["id"]))
             conn.execute("UPDATE allocations SET status='handed_off',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "handoff_accepted", {"handoff_id": handoff["id"]})
@@ -277,6 +346,7 @@ class OrganAllocationService:
         with self.repo.tx() as conn:
             row = self._ensure_active(conn, allocation_id, actor, role)
             if row["status"] != "handed_off": raise ApiError(409, "invalid_transition", "交接完成后才能确认植入")
+            self._cold_guard(conn, row, actor, role, "implant", body)
             conn.execute("UPDATE allocations SET status='implanted',implanted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             conn.execute("UPDATE donors SET status='used',revision=revision+1 WHERE id=?", (row["donor_id"],))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "organ_implanted", {"candidate_id": row["candidate_id"]})
@@ -293,7 +363,9 @@ class OrganAllocationService:
             if row["status"] not in {"proposed", "accepted"}: raise ApiError(409, "invalid_transition", "转运开始后不能直接撤回")
             conn.execute("UPDATE allocations SET status='withdrawn',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
             donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
-            donor_status = "available" if parse_time(donor["expires_at"]) > utcnow() else "expired"
+            cold = cold_ischemia_info(donor)
+            if donor["status"] == "failed" or (cold and cold["level"] == "exceeded"): donor_status = "failed"
+            else: donor_status = "available" if parse_time(donor["expires_at"]) > utcnow() else "expired"
             conn.execute("UPDATE donors SET status=?,revision=revision+1 WHERE id=?", (donor_status, row["donor_id"]))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_withdrawn", {"reason": reason})
             return self._allocation(conn, allocation_id, role, hospital)
@@ -319,6 +391,11 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
+        donor_map = {row["id"]: row for row in conn.execute("SELECT * FROM donors")}
+        for donor in donors: donor["cold_ischemia"] = cold_ischemia_info(donor)
+        for allocation in allocated:
+            donor_row = donor_map.get(allocation.get("donor_id"))
+            allocation["cold_ischemia"] = cold_ischemia_info(donor_row) if donor_row else None
         return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
 
 
